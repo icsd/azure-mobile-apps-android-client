@@ -431,41 +431,121 @@ public class MobileServiceSyncContext {
                 // same order, independent of unlock order. Op then Table then
                 // Id.
 
-                // get SHARED access to op lock
-                this.mOpLock.readLock().lock();
+                busyPullDone = processCustom(invTableName, query, queryId, pushFuture, busyPullDone);
 
-                try {
-                    // get EXCLUSIVE access to table lock
-                    MultiReadWriteLock<String> multiRWLock = this.mTableLockMap.lockWrite(invTableName);
-
-                    try {
-                        int pendingTable = this.mOpQueue.countPending(invTableName);
-
-                        if (pendingTable > 0) {
-                            pushFuture = push();
-                        } else {
-                            processPull(invTableName, query, queryId);
-                        }
-                    } finally {
-                        this.mTableLockMap.unLockWrite(multiRWLock);
-                    }
-                } finally {
-                    this.mOpLock.readLock().unlock();
-                }
-
-                if (pushFuture != null) {
-                    try {
-                        pushFuture.get();
-                    } catch (ExecutionException e) {
-                        throw e.getCause();
-                    }
-                } else {
-                    busyPullDone = true;
-                }
             }
         } finally {
             this.mInitLock.readLock().unlock();
         }
+    }
+
+    private boolean processCustom(String invTableName, Query query, String queryId, ListenableFuture<Void> pushFuture, boolean busyPullDone) throws Throwable {
+
+        this.mOpLock.readLock().lock();
+
+        try {
+            // get EXCLUSIVE access to table lock
+            MultiReadWriteLock<String> multiRWLock = this.mTableLockMap.lockWrite(invTableName);
+
+            try {
+                int pendingTable = this.mOpQueue.countPending(invTableName);
+
+                if (pendingTable > 0) {
+                    pushFuture = push();
+                }
+            } finally {
+                this.mTableLockMap.unLockWrite(multiRWLock);
+            }
+
+            processPullCustom(invTableName,query,queryId);
+
+        } finally {
+            this.mOpLock.readLock().unlock();
+        }
+
+        if (pushFuture != null) {
+            try {
+                pushFuture.get();
+            } catch (ExecutionException e) {
+                throw e.getCause();
+            }
+        } else {
+            busyPullDone = true;
+        }
+        return busyPullDone;
+    }
+
+
+    private void processPullCustom(String tableName, Query query, String queryId) throws Throwable {
+
+        try {
+
+            MobileServiceJsonTable table = this.mClient.getTable(tableName);
+
+            table.addFeature(MobileServiceFeatures.Offline);
+
+            if (query == null) {
+                query = table.top(1000).orderBy("id", QueryOrder.Ascending);
+            } else {
+                query = query.deepClone();
+            }
+
+            PullStrategy strategy;
+
+            if (queryId != null) {
+                strategy = new IncrementalPullStrategy(query, queryId, this.mStore, table);
+            } else {
+                strategy = new PullStrategy(query, table);
+            }
+
+            strategy.initialize();
+
+            JsonArray elements = null;
+
+            do {
+                // For each request that is made, the corresponding Table is locked
+                // so that the new records are written to it
+                // and then it is unlocked
+                // The number of records in the request are equal to the Page Size
+
+
+                // get EXCLUSIVE access to table lock
+                MultiReadWriteLock<String> multiRWLock = this.mTableLockMap.lockWrite(tableName);
+                try {
+
+                    JsonElement result = table.execute(strategy.getLastQuery()).get();
+
+                    if (result != null) {
+
+                        if (result.isJsonObject()) {
+                            JsonObject jsonObject = result.getAsJsonObject();
+
+                            if (jsonObject.has("results") && jsonObject.get("results").isJsonArray()) {
+                                elements = jsonObject.get("results").getAsJsonArray();
+                            }
+
+                        } else if (result.isJsonArray()) {
+                            elements = result.getAsJsonArray();
+                        }
+
+                        processElements(tableName, elements);
+
+                        strategy.onResultsProcessed(elements);
+                    }
+
+                }finally {
+                    this.mTableLockMap.unLockWrite(multiRWLock);
+                }
+
+            }
+            while (strategy.moveToNextPage(elements.size()));
+
+        } catch (ExecutionException e) {
+            throw e.getCause();
+        } catch (RuntimeException e) {
+            throw e.getCause();
+        }
+
     }
 
     /**
